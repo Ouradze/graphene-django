@@ -5,10 +5,11 @@ import re
 import six
 from django.http import HttpResponse, HttpResponseNotAllowed
 from django.http.response import HttpResponseBadRequest
+from django.middleware.csrf import get_token
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
 from django.views.generic import View
-from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.csrf import csrf_exempt
 
 from graphql import get_default_backend
 from graphql.error import format_error as format_graphql_error
@@ -17,6 +18,9 @@ from graphql.execution import ExecutionResult
 from graphql.type.schema import GraphQLSchema
 
 from .settings import graphene_settings
+
+
+DEFAULT_PLAYGROUND_OPTIONS = {"request.credentials": "same-origin"}
 
 
 class HttpError(Exception):
@@ -50,19 +54,19 @@ def instantiate_middleware(middlewares):
         yield middleware
 
 
+@method_decorator(csrf_exempt, name="dispatch")
 class GraphQLView(View):
-    graphiql_version = "0.14.0"
-    graphiql_template = "graphene/graphiql.html"
-    react_version = "16.8.6"
+    playground_template = "graphene/playground.html"
 
     schema = None
-    graphiql = False
+    playground = False
     executor = None
     backend = None
     middleware = None
     root_value = None
     pretty = False
     batch = False
+    playground_options = None
 
     def __init__(
         self,
@@ -70,10 +74,11 @@ class GraphQLView(View):
         executor=None,
         middleware=None,
         root_value=None,
-        graphiql=False,
+        playground=False,
         pretty=False,
         batch=False,
         backend=None,
+        playground_options=None,
     ):
         if not schema:
             schema = graphene_settings.SCHEMA
@@ -90,14 +95,16 @@ class GraphQLView(View):
         self.executor = executor
         self.root_value = root_value
         self.pretty = self.pretty or pretty
-        self.graphiql = self.graphiql or graphiql
+        self.playground = self.playground or playground
         self.batch = self.batch or batch
         self.backend = backend
 
         assert isinstance(
             self.schema, GraphQLSchema
         ), "A Schema is required to be provided to GraphQLView."
-        assert not all((graphiql, batch)), "Use either graphiql or batch processing"
+        assert not all(
+            (playground, batch)
+        ), "Use either graphql playground or batch processing"
 
     # noinspection PyUnusedLocal
     def get_root_value(self, request):
@@ -112,7 +119,6 @@ class GraphQLView(View):
     def get_backend(self, request):
         return self.backend
 
-    @method_decorator(ensure_csrf_cookie)
     def dispatch(self, request, *args, **kwargs):
         try:
             if request.method.lower() not in ("get", "post"):
@@ -123,14 +129,12 @@ class GraphQLView(View):
                 )
 
             data = self.parse_body(request)
-            show_graphiql = self.graphiql and self.can_display_graphiql(request, data)
+            show_playground = self.playground and self.can_display_playground(
+                request, data
+            )
 
-            if show_graphiql:
-                return self.render_graphiql(
-                    request,
-                    graphiql_version=self.graphiql_version,
-                    react_version=self.react_version,
-                )
+            if show_playground:
+                return self.render_playground(request)
 
             if self.batch:
                 responses = [self.get_response(request, entry) for entry in data]
@@ -143,7 +147,7 @@ class GraphQLView(View):
                     or 200
                 )
             else:
-                result, status_code = self.get_response(request, data, show_graphiql)
+                result, status_code = self.get_response(request, data, show_playground)
 
             return HttpResponse(
                 status=status_code, content=result, content_type="application/json"
@@ -157,11 +161,11 @@ class GraphQLView(View):
             )
             return response
 
-    def get_response(self, request, data, show_graphiql=False):
+    def get_response(self, request, data, show_playground=False):
         query, variables, operation_name, id = self.get_graphql_params(request, data)
 
         execution_result = self.execute_graphql_request(
-            request, data, query, variables, operation_name, show_graphiql
+            request, data, query, variables, operation_name, show_playground
         )
 
         status_code = 200
@@ -182,14 +186,22 @@ class GraphQLView(View):
                 response["id"] = id
                 response["status"] = status_code
 
-            result = self.json_encode(request, response, pretty=show_graphiql)
+            result = self.json_encode(request, response, pretty=show_playground)
         else:
             result = None
 
         return result, status_code
 
-    def render_graphiql(self, request, **data):
-        return render(request, self.graphiql_template, data)
+    def render_playground(self, request):
+        options = DEFAULT_PLAYGROUND_OPTIONS.copy()
+
+        if self.playground_options:
+            options.update(self.playground_options)
+        return render(
+            request,
+            self.playground_template,
+            {"playground_options": json.dumps(options)},
+        )
 
     def json_encode(self, request, d, pretty=False):
         if not (self.pretty or pretty) and not request.GET.get("pretty"):
@@ -238,10 +250,10 @@ class GraphQLView(View):
         return {}
 
     def execute_graphql_request(
-        self, request, data, query, variables, operation_name, show_graphiql=False
+        self, request, data, query, variables, operation_name, show_playground=False
     ):
         if not query:
-            if show_graphiql:
+            if show_playground:
                 return None
             raise HttpError(HttpResponseBadRequest("Must provide query string."))
 
@@ -254,7 +266,7 @@ class GraphQLView(View):
         if request.method.lower() == "get":
             operation_type = document.get_operation_type(operation_name)
             if operation_type and operation_type != "query":
-                if show_graphiql:
+                if show_playground:
                     return None
 
                 raise HttpError(
@@ -279,13 +291,13 @@ class GraphQLView(View):
                 operation_name=operation_name,
                 context=self.get_context(request),
                 middleware=self.get_middleware(request),
-                **extra_options
+                **extra_options,
             )
         except Exception as e:
             return ExecutionResult(errors=[e], invalid=True)
 
     @classmethod
-    def can_display_graphiql(cls, request, data):
+    def can_display_playground(cls, request, data):
         raw = "raw" in request.GET or "raw" in data
         return not raw and cls.request_wants_html(request)
 
